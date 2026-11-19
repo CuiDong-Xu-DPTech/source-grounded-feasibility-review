@@ -32,7 +32,9 @@ Keep run state separate: `success`, `partial`, `failed`, or `stuck`, subject to 
 
 ## The seven-axis evidence matrix
 
-For every candidate, explicitly review all seven axes and every actual public rubric/hard requirement in the case. Prefer a stable check ID, source-grounded requirement, scope/applicability, expected threshold, observation, judgment, source locator, calculation ID, uncertainty, and actionable disposition. Cover the row even when it is missing or inapplicable.
+For every candidate, explicitly review all seven axes and every actual public rubric/hard requirement in the case. Prefer a stable check ID, source-grounded requirement, scope/applicability, expected threshold, observation, judgment, source locator, calculation ID, uncertainty, and actionable disposition. Cover the row even when it is missing or inapplicable. Resolve `applies_to`/scope before assigning the row.
+
+Trace current plan pointer → candidate statement or scenario input → external support or calculation → judgment → this plan's disposition. In particular distinguish `paper_method`, `candidate_commitment`, `scenario_input` and `derived_value`. A relevant method in a cited paper, a shared evidence list, or an identifier that happens to be reused does not establish that the current candidate commits to it. A method-facet `met` requires positive evidence matching the precise operation; preserve the difference between an unspecified action and proof that it was not performed. Cross-plan references belong in explicit comparisons or change records, not stale copied dispositions. Reuse case calculation IDs exactly; define any local derived label at its point of use with its formula, unit, value and locator.
 
 1. **Assumptions and variables.** Trace objective → testable proposition → experimental/observational unit → independent/response/confounding variables → measurement and judgment criterion. Separate supplied facts from assumptions requiring validation.
 2. **Controls and comparisons.** Ask which alternative explanation or bias each control addresses, and whether it matches the study objective. Check groups, allocation/repeats, batch/operator/time effects and analysis assumptions when applicable. Do not prescribe a universal number or kind of controls.
@@ -46,9 +48,11 @@ Use domain-specific guidance only when its actual applicability conditions hold.
 
 ## Evidence and provenance
 
-Use a `sha256:<hex>` source ID computed from actual file bytes. Per judgment retain file/source ID, exact plan reference, page (physical page 1-based), section/table/row or RFC 6901 JSON Pointer as appropriate, and a short verbatim quote where available. Equal repeated text needs surrounding context or a more precise locator. Never invent page, DOI, quotation, authorization ID, or material contents.
+Use a `sha256:<hex>` source ID computed from actual file bytes, unless the actual case explicitly requires a declared scenario/contract source ID. In that exception use the exact declaration with an in-scope, resolvable case JSON Pointer; the validator re-binds it to the real case-file hash rather than accepting an unregistered alias. Never apply a scenario alias to paper facts or unrelated file provenance. Per judgment retain file/source ID, exact plan reference, page (physical page 1-based), section/table/row or RFC 6901 JSON Pointer as appropriate, and a short verbatim quote where available. Equal repeated text needs surrounding context or a more precise locator. Never invent page, DOI, quotation, authorization ID, or material contents.
 
 Maintain a source registry and actual extraction log: tool/version/arguments, start/end or timestamps where captured, exit status, output paths, covered/failed pages, and error. An OCR pass is a separate extraction activity. Read critical tables and numbers from rendered pages when reliable extraction is uncertain; a cached text layer is not automatically correct.
+
+Register generated extraction files with `--additional-resource-root` instead of changing the primary resource root. Original paper IDs and derived text-file IDs differ; use `derived_from_source_id` for the parent relation, not as an alias for the derived file's own `source_id`. Matching an extraction's quote and hash does not independently establish a PDF page's rendered contents, so retain that boundary rather than upgrading a partial check to full verification.
 
 Do not add fields to a closed output contract. Put supplementary source details in `/app/output/evidence_map.json` and link its entries to actual result JSON Pointers when necessary. Runtime evidence may supplement, never replace, original fields.
 

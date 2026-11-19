@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 
 
 SOURCE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -68,6 +69,7 @@ class Report:
             "evidence_map": {"provided": False, "checked": False},
             "exact_placeholders": {"checked": False, "findings": 0},
             "duplicate_identifiers": {"checked": False, "findings": 0},
+            "semantic_diagnostics": {"checked": False},
         }
 
     def error(self, code, message, pointer=None, **details):
@@ -186,6 +188,22 @@ def load_strict_json(path, label):
 
 def normalize_whitespace(value):
     return " ".join(value.split())
+
+
+TYPESETTING_LINE_HYPHEN_RE = re.compile(r"(?<=[^\W\d_])-[ \t]*\r?\n[ \t]*(?=[^\W\d_])")
+
+
+def typesetting_candidates(value):
+    compatible = unicodedata.normalize("NFKC", value).replace("\u00AD", "")
+    variants = [compatible, TYPESETTING_LINE_HYPHEN_RE.sub("-", compatible), TYPESETTING_LINE_HYPHEN_RE.sub("", compatible)]
+    result = []
+    seen = set()
+    for variant in variants:
+        normalized = normalize_whitespace(variant)
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
 
 
 def decode_pointer_token(token):
@@ -914,6 +932,198 @@ def validate_placeholders_and_ids(result, report):
     }
 
 
+SUSPICIOUS_DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9_.,])0{2,}\.[0-9]*[1-9][0-9]*(?![A-Za-z0-9_.])")
+SEMANTIC_POINTER_KEYS = {"case_json_pointer", "json_pointer", "pointer", "source_pointer", "scenario_pointer"}
+PLAN_POINTER_RE = re.compile(r"^/plans/(0|[1-9][0-9]*)(?:/|$)")
+
+
+def semantic_field_name(key):
+    return re.sub(r"[^a-z0-9_]+", "_", key.lower()).strip("_")
+
+
+def is_observation_fact_statement_field(key):
+    normalized = semantic_field_name(key)
+    if any(term in normalized for term in ("requirement", "rubric", "formula")):
+        return False
+    return (
+        normalized in ("observed", "observation", "fact", "facts", "statement", "statements")
+        or normalized.startswith(("observed_", "observation_", "fact_", "facts_", "statement_", "statements_"))
+    )
+
+
+def empty_semantic_context():
+    return {
+        "plan_id": None,
+        "plan_version": None,
+        "scope_ambiguous": False,
+        "contrast": False,
+        "contrast_plan_ids": set(),
+    }
+
+
+def explicit_contrast_value(key, value):
+    normalized = semantic_field_name(key)
+    if normalized in ("compare", "contrast", "comparison", "compare_with", "contrast_with"):
+        return bool(value)
+    if normalized in ("relation", "comparison_relation", "provenance", "change_type", "mode"):
+        if isinstance(value, str):
+            tokens = set(semantic_field_name(value).split("_"))
+            return bool(tokens & {"compare", "comparison", "contrast", "baseline", "previous"})
+    return False
+
+
+def context_with_semantic_fields(inherited, item):
+    context = {
+        "plan_id": inherited["plan_id"],
+        "plan_version": inherited["plan_version"],
+        "scope_ambiguous": inherited["scope_ambiguous"],
+        "contrast": inherited["contrast"],
+        "contrast_plan_ids": set(inherited["contrast_plan_ids"]),
+    }
+    if "plan_id" in item:
+        value = item["plan_id"]
+        if isinstance(value, str) and value.strip():
+            if context["plan_id"] is not None and context["plan_id"] != value:
+                context["scope_ambiguous"] = True
+            context["plan_id"] = value
+        elif value is not None:
+            context["scope_ambiguous"] = True
+    for key in ("plan_version", "version"):
+        if key in item and isinstance(item[key], str) and item[key].strip():
+            context["plan_version"] = item[key]
+            break
+    contrast_endpoint_keys = {
+        "from_plan_id", "to_plan_id", "previous_plan_id", "baseline_plan_id",
+        "compare_plan_id", "contrast_plan_id", "compare_with_plan_id", "contrast_with_plan_id",
+    }
+    for key, value in item.items():
+        normalized = semantic_field_name(key)
+        if normalized in contrast_endpoint_keys:
+            if isinstance(value, str) and value.strip():
+                context["contrast"] = True
+                context["contrast_plan_ids"].add(value)
+        if explicit_contrast_value(key, value):
+            context["contrast"] = True
+    return context
+
+
+def scan_semantic_consistency(document, case, report, document_label="result", result_scopes=None, result_document=None):
+    if result_scopes is None:
+        result_scopes = {}
+    state = report.checked["semantic_diagnostics"]
+    state["checked"] = True
+    counts = state.setdefault(document_label, {
+        "suspicious_numeric_literals": 0, "plan_reference_scope_mismatches": 0,
+        "unknown_plan_targets": 0, "scope_undetermined": 0,
+    })
+    seen_literals = set()
+    seen_plan_references = set()
+    known_plan_ids = {
+        plan.get("plan_id") for plan in case.get("plans", [])
+        if isinstance(plan, dict) and isinstance(plan.get("plan_id"), str) and plan.get("plan_id")
+    }
+    if document_label == "result":
+        counts["foreign_plan_disposition_references"] = 0
+    stack = [(document, "", "", empty_semantic_context())]
+    while stack:
+        value, pointer, key_context, inherited_context = stack.pop()
+        if (
+            document_label == "result" and isinstance(value, str)
+            and semantic_field_name(key_context) in ("required_action", "recheck")
+            and inherited_context["plan_id"] is not None
+            and not inherited_context["scope_ambiguous"] and not inherited_context["contrast"]
+        ):
+            foreign_ids = sorted(
+                plan_id for plan_id in known_plan_ids - {inherited_context["plan_id"]}
+                if re.search(r"(?<![A-Za-z0-9_])" + re.escape(plan_id) + r"(?![A-Za-z0-9_])", value)
+            )
+            if foreign_ids:
+                report.warning(
+                    "foreign_plan_disposition_reference",
+                    "A disposition inside one plan mentions another candidate ID. Return to this plan's actual gate or an explicitly scoped change record; this warning neither rewrites the text nor establishes scientific error.",
+                    pointer, current_plan_id=inherited_context["plan_id"], mentioned_plan_ids=foreign_ids,
+                    source_field_path=pointer,
+                )
+                counts["foreign_plan_disposition_references"] += 1
+        if isinstance(value, str) and is_observation_fact_statement_field(key_context):
+            for match in SUSPICIOUS_DECIMAL_RE.finditer(value):
+                literal = match.group(0)
+                diagnostic_pointer = pointer if document_label == "result" else document_label + pointer
+                dedupe_key = (literal, diagnostic_pointer)
+                if dedupe_key in seen_literals:
+                    continue
+                seen_literals.add(dedupe_key)
+                report.warning(
+                    "suspicious_numeric_literal",
+                    "Nonstandard decimal notation has repeated leading zeros. Return to the real source for review; this lint does not repair the literal or guarantee scientific correctness.",
+                    diagnostic_pointer, literal=literal, source_field_path=diagnostic_pointer,
+                    evidence="observation/fact/statement field only; no automatic zero-fill or substitution",
+                )
+                counts["suspicious_numeric_literals"] += 1
+        if isinstance(value, dict):
+            context = context_with_semantic_fields(inherited_context, value)
+            if document_label == "result":
+                result_scopes[pointer] = context
+            elif (
+                result_document is not None and context["plan_id"] is None
+                and not context["scope_ambiguous"] and isinstance(value.get("result_pointer"), str)
+            ):
+                result_pointer = value["result_pointer"]
+                try:
+                    resolve_json_pointer(result_document, result_pointer)
+                    pointed_context = result_scopes.get(result_pointer)
+                    if pointed_context is not None and pointed_context["plan_id"] is not None:
+                        context = context_with_semantic_fields(pointed_context, value)
+                except (ValueError, KeyError):
+                    pass
+            for key, child in value.items():
+                child_pointer_value = child_pointer(pointer, key)
+                if key in SEMANTIC_POINTER_KEYS and isinstance(child, str) and PLAN_POINTER_RE.match(child):
+                    try:
+                        resolve_json_pointer(case, child)
+                    except (ValueError, KeyError):
+                        counts["unknown_plan_targets"] += 1
+                        continue
+                    plan_index = int(PLAN_POINTER_RE.match(child).group(1))
+                    case_plans = case.get("plans")
+                    target_plan = (
+                        case_plans[plan_index]
+                        if isinstance(case_plans, list) and plan_index < len(case_plans) else None
+                    )
+                    target_plan_id = target_plan.get("plan_id") if isinstance(target_plan, dict) else None
+                    if not isinstance(target_plan_id, str) or not target_plan_id:
+                        counts["unknown_plan_targets"] += 1
+                        continue
+                    if context["plan_id"] is None or context["scope_ambiguous"]:
+                        counts["scope_undetermined"] += 1
+                        continue
+                    if context["contrast"]:
+                        continue
+                    if context["plan_id"] == target_plan_id:
+                        continue
+                    dedupe_key = (context["plan_id"], child)
+                    if dedupe_key in seen_plan_references:
+                        continue
+                    seen_plan_references.add(dedupe_key)
+                    diagnostic_pointer = child_pointer_value if document_label == "result" else document_label + child_pointer_value
+                    details = {}
+                    if context["plan_version"] is not None:
+                        details["current_plan_version"] = context["plan_version"]
+                    report.warning(
+                        "plan_reference_scope_mismatch",
+                        "The current result plan and the actual case plan at this locator differ. This is a conservative cross-check, not an automatic rewrite or scientific score.",
+                        diagnostic_pointer, current_plan_id=context["plan_id"],
+                        target_case_plan_id=target_plan_id, target_pointer=child,
+                        source_field_path=diagnostic_pointer, **details
+                    )
+                    counts["plan_reference_scope_mismatches"] += 1
+                stack.append((child, child_pointer_value, key, context))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                stack.append((child, child_pointer(pointer, index), key_context, inherited_context))
+    return result_scopes
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     total = 0
@@ -925,6 +1135,55 @@ def sha256_file(path):
             total += len(chunk)
             digest.update(chunk)
     return "sha256:" + digest.hexdigest(), total
+
+
+def pointer_within(pointer, prefix):
+    return pointer == prefix or pointer.startswith(prefix + "/")
+
+
+def collect_scenario_aliases(case):
+    declarations = {}
+    stack = [(case, "")]
+    while stack:
+        value, pointer = stack.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = child_pointer(pointer, key)
+                if isinstance(child, str) and child.strip():
+                    if key in ("scenario_source_id", "scenario_id") and pointer_within(pointer, "/scenario_scope"):
+                        declarations.setdefault(child, []).append(pointer)
+                    elif key == "source_id" and pointer == "/scenario_scope":
+                        declarations.setdefault(child, []).append(pointer)
+                    elif key == "contract_id" and pointer_within(pointer, "/resource_price_booking_contracts"):
+                        declarations.setdefault(child, []).append(pointer)
+                stack.append((child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                stack.append((child, child_pointer(pointer, index)))
+    return declarations
+
+
+def resolve_declared_scenario_alias(registry, case, source_id, pointer_key, pointer_value, evidence_pointer):
+    if not pointer_key or not isinstance(pointer_value, str):
+        return None
+    matches = collect_scenario_aliases(case).get(source_id, [])
+    for parent in matches:
+        if pointer_within(parent, "/scenario_scope"):
+            allowed = (parent, "/plans", "/resource_price_booking_contracts")
+        elif pointer_within(parent, "/resource_price_booking_contracts"):
+            allowed = (parent, "/plans")
+        else:
+            allowed = (parent,)
+        if not any(pointer_within(pointer_value, prefix) for prefix in allowed):
+            continue
+        try:
+            resolve_json_pointer(case, pointer_value)
+        except (ValueError, KeyError):
+            continue
+        entry = registry.unique_path_entry(registry.case_path)
+        if entry is not None:
+            return entry
+    return None
 
 
 class SourceRegistry:
@@ -950,6 +1209,24 @@ class SourceRegistry:
                 "Relative evidence paths can only be resolved against the case directory unless an entry already has an absolute registered path.",
             )
         registry = inspection.get("source_registry")
+        self.additional_resource_roots = []
+        metadata = inspection.get("metadata")
+        root_metadata = (
+            registry.get("additional_resource_roots")
+            if isinstance(registry, dict) and isinstance(registry.get("additional_resource_roots"), list)
+            else metadata.get("additional_resource_roots") if isinstance(metadata, dict) else []
+        )
+        if isinstance(root_metadata, list):
+            for additional_root in root_metadata:
+                if not isinstance(additional_root, str) or not additional_root:
+                    self.report.warning(
+                        "invalid_additional_resource_root",
+                        "A non-string or empty additional resource root was ignored; registered absolute paths remain available.",
+                    )
+                    continue
+                absolute_root = os.path.abspath(additional_root)
+                if absolute_root not in self.additional_resource_roots:
+                    self.additional_resource_roots.append(absolute_root)
         raw_entries = registry.get("sources") if isinstance(registry, dict) else None
         if not isinstance(raw_entries, list):
             report.error("invalid_source_registry", "Inspection source_registry.sources must be an array.")
@@ -1000,6 +1277,17 @@ class SourceRegistry:
             return next(iter(variants.values()))
         return None
 
+    def path_candidates(self, raw_path):
+        if os.path.isabs(raw_path):
+            return [os.path.abspath(raw_path)]
+        candidates = []
+        if self.resource_root:
+            candidates.append(os.path.abspath(os.path.join(self.resource_root, raw_path)))
+        for root in self.additional_resource_roots:
+            candidates.append(os.path.abspath(os.path.join(root, raw_path)))
+        candidates.append(os.path.abspath(os.path.join(self.case_directory, raw_path)))
+        return list(dict.fromkeys(candidates))
+
     def resolve_path(self, raw_path, evidence_pointer):
         if not isinstance(raw_path, str) or not raw_path:
             self.report.error(
@@ -1007,22 +1295,16 @@ class SourceRegistry:
                 actual_type=json_type(raw_path),
             )
             return None
-        if os.path.isabs(raw_path):
-            candidates = [os.path.abspath(raw_path)]
-        else:
-            candidates = []
-            if self.resource_root:
-                candidates.append(os.path.abspath(os.path.join(self.resource_root, raw_path)))
-            candidates.append(os.path.abspath(os.path.join(self.case_directory, raw_path)))
+        candidates = self.path_candidates(raw_path)
         registered = []
-        for candidate in dict.fromkeys(candidates):
+        for candidate in candidates:
             if candidate in self.by_path:
                 registered.append(candidate)
         if len(registered) != 1:
             if len(registered) > 1:
                 self.report.error(
                     "ambiguous_evidence_path",
-                    "Relative evidence path resolves to multiple registered files; no file is selected.",
+                    "Relative evidence path resolves to multiple registered files across original/additional roots; no file is selected.",
                     evidence_pointer, path=raw_path, candidates=registered,
                 )
             else:
@@ -1051,9 +1333,9 @@ class SourceRegistry:
             return None
         if len(paths) == 1:
             return next(iter(paths.values()))
-        self.report.warning(
-            "source_id_has_multiple_paths",
-            "Source_id identifies multiple same-hash paths; evidence must supply path for unique path/locator and quote checks.",
+        self.report.error(
+            "ambiguous_evidence_source_id",
+            "Source_id identifies multiple registered paths; source identity alone cannot select one for evidence.",
             evidence_pointer, source_id=source_id, paths=sorted(paths),
         )
         return None
@@ -1157,7 +1439,46 @@ def read_text_source(entry, evidence_pointer, report):
         return None
 
 
-def provided_pdf_text(item, evidence_pointer, registry, report):
+def read_registered_extraction_text(entry, evidence_pointer, report):
+    path = entry["path"]
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        report.warning(
+            "provided_extraction_decode_failed",
+            "Registered derivation is not readable strict UTF-8: %s." % exc,
+            evidence_pointer, path=path,
+        )
+        return None
+    if entry.get("extension", os.path.splitext(path)[1]).lower() != ".json":
+        return text
+    try:
+        extracted = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, InputError, RecursionError) as exc:
+        report.warning(
+            "provided_extraction_invalid_json",
+            "Registered JSON derivation is not strict JSON with an explicit text field: %s." % exc,
+            evidence_pointer, path=path,
+        )
+        return None
+    if isinstance(extracted, str):
+        return extracted
+    if isinstance(extracted, dict) and isinstance(extracted.get("text"), str):
+        return extracted["text"]
+    report.warning(
+        "provided_extraction_text_field_missing",
+        "JSON derivation must contain a string text field (or be a JSON string); metadata is not treated as extracted content.",
+        evidence_pointer, path=path,
+    )
+    return None
+
+
+def provided_pdf_text(item, evidence_pointer, registry, report, pdf_entry):
     texts = []
     direct = item.get("extracted_text")
     if isinstance(direct, str):
@@ -1171,11 +1492,17 @@ def provided_pdf_text(item, evidence_pointer, registry, report):
     provided = item.get("provided_extraction")
     if isinstance(provided, dict) and isinstance(provided.get("text"), str):
         texts.append(("provided_extraction.text", provided["text"]))
+    if isinstance(provided, dict) and "source_id" in provided and "path" not in provided:
+        report.error(
+            "derived_source_id_requires_path",
+            "A derived source id without a derivation path cannot establish which extraction bytes supplied the text.",
+            child_pointer(evidence_pointer, "provided_extraction"),
+        )
     extraction_paths = []
     for key in EXTRACTION_PATH_KEYS:
         value = item.get(key)
         if isinstance(value, str):
-            extraction_paths.append((key, value))
+            extraction_paths.append((key, value, None))
         elif value is not None:
             report.warning(
                 "invalid_extraction_path",
@@ -1183,36 +1510,67 @@ def provided_pdf_text(item, evidence_pointer, registry, report):
                 child_pointer(evidence_pointer, key),
             )
     if isinstance(provided, dict) and isinstance(provided.get("path"), str):
-        extraction_paths.append(("provided_extraction.path", provided["path"]))
-    for key, raw_path in extraction_paths:
-        candidates = [os.path.abspath(raw_path)] if os.path.isabs(raw_path) else []
-        if not candidates:
-            if registry.resource_root:
-                candidates.append(os.path.abspath(os.path.join(registry.resource_root, raw_path)))
-            candidates.append(os.path.abspath(os.path.join(registry.case_directory, raw_path)))
-        existing = []
-        for path in candidates:
-            try:
-                if stat.S_ISREG(os.lstat(path).st_mode) and not stat.S_ISLNK(os.lstat(path).st_mode):
-                    existing.append(path)
-            except OSError:
-                pass
-        if len(existing) != 1:
-            report.warning(
-                "provided_extraction_unavailable",
-                "Provided extraction text path is missing or ambiguous; PDF content remains unverified.",
-                child_pointer(evidence_pointer, key), attempted_paths=candidates,
+        extraction_paths.append(("provided_extraction.path", provided["path"], provided))
+    for label, raw_path, derivation in extraction_paths:
+        field_pointer = (
+            child_pointer(child_pointer(evidence_pointer, "provided_extraction"), "path")
+            if derivation is not None else child_pointer(evidence_pointer, label)
+        )
+        entry = registry.resolve_path(raw_path, field_pointer)
+        if entry is None:
+            continue
+        if entry["path"] == pdf_entry["path"] or entry.get("extension", "").lower() == ".pdf":
+            report.error(
+                "derived_extraction_requires_text_artifact",
+                "provided_extraction.path must identify a registered text/JSON derivation, not the original or another PDF; PDF bytes are not decoded as extraction text.",
+                field_pointer, path=entry["path"],
             )
             continue
-        try:
-            with open(existing[0], "rb") as handle:
-                texts.append((key, handle.read().decode("utf-8")))
-        except (OSError, UnicodeDecodeError) as exc:
-            report.warning(
-                "provided_extraction_decode_failed",
-                "Provided extraction is not readable strict UTF-8: %s." % exc,
-                child_pointer(evidence_pointer, key),
-            )
+        derived_source_id = None
+        relationship_ok = True
+        if derivation is not None:
+            derived_pointer = child_pointer(evidence_pointer, "provided_extraction")
+            if "derived_from_source_id" in derivation:
+                parent_source_id = derivation["derived_from_source_id"]
+                if not isinstance(parent_source_id, str) or not SOURCE_ID_RE.match(parent_source_id):
+                    report.error(
+                        "invalid_derived_from_source_id",
+                        "derived_from_source_id must be a sha256 source id, not the derived file's own source_id.",
+                        child_pointer(derived_pointer, "derived_from_source_id"),
+                    )
+                    relationship_ok = False
+                elif parent_source_id != pdf_entry["source_id"]:
+                    report.error(
+                        "derived_from_source_id_mismatch",
+                        "Derived extraction parent id does not equal the outer registered PDF source_id.",
+                        child_pointer(derived_pointer, "derived_from_source_id"),
+                        parent_source_id=parent_source_id, pdf_source_id=pdf_entry["source_id"],
+                    )
+                    relationship_ok = False
+            if "source_id" in derivation and derivation["source_id"] is not None:
+                candidate_id = derivation["source_id"]
+                derived_id_pointer = child_pointer(derived_pointer, "source_id")
+                if not isinstance(candidate_id, str) or not SOURCE_ID_RE.match(candidate_id):
+                    report.error(
+                        "invalid_derived_source_id",
+                        "provided_extraction.source_id must be the derived bytes' independent sha256 source id.",
+                        derived_id_pointer,
+                    )
+                    relationship_ok = False
+                else:
+                    derived_source_id = candidate_id
+                    if candidate_id not in registry.by_id:
+                        registry.entry_for_source_id(candidate_id, derived_id_pointer)
+                        relationship_ok = False
+            else:
+                derived_source_id = None
+        if not relationship_ok:
+            continue
+        if not registry.check_hash(entry, derived_source_id, field_pointer):
+            continue
+        text = read_registered_extraction_text(entry, field_pointer, report)
+        if text is not None:
+            texts.append((label, text))
     return texts
 
 
@@ -1303,6 +1661,9 @@ def validate_evidence_item(item, evidence_pointer, case, case_path, registry, re
         "locator_content_status": "not_checked",
     }
     report.checked["evidence"].append(state)
+    path_key, raw_path = alias_value(item, EVIDENCE_PATH_KEYS, "path", evidence_pointer, report)
+    pointer_key, source_pointer = alias_value(item, EVIDENCE_POINTER_KEYS, "json_pointer", evidence_pointer, report)
+    quote_key, quote = alias_value(item, QUOTE_KEYS, "quote", evidence_pointer, report)
     source_key = "source_id" if "source_id" in item and item["source_id"] is not None else None
     claimed_source_id = item.get("source_id") if source_key else None
     if claimed_source_id is not None and not isinstance(claimed_source_id, str):
@@ -1313,23 +1674,40 @@ def validate_evidence_item(item, evidence_pointer, case, case_path, registry, re
         claimed_source_id = None
         state["source_id_status"] = "invalid"
     elif claimed_source_id is not None:
-        if not SOURCE_ID_RE.match(claimed_source_id):
-            report.error(
-                "invalid_evidence_source_id", "Evidence source_id does not have sha256:<64 lowercase hex> format.",
-                child_pointer(evidence_pointer, "source_id"), source_id=claimed_source_id,
-            )
-            state["source_id_status"] = "invalid"
-            claimed_source_id = None
-        else:
+        if SOURCE_ID_RE.match(claimed_source_id):
             state["source_id_status"] = "present"
-    path_key, raw_path = alias_value(item, EVIDENCE_PATH_KEYS, "path", evidence_pointer, report)
-    pointer_key, source_pointer = alias_value(item, EVIDENCE_POINTER_KEYS, "json_pointer", evidence_pointer, report)
-    quote_key, quote = alias_value(item, QUOTE_KEYS, "quote", evidence_pointer, report)
+        else:
+            alias_entry = resolve_declared_scenario_alias(
+                registry, case, claimed_source_id, pointer_key, source_pointer, evidence_pointer
+            )
+            if alias_entry is not None:
+                state["declared_scenario_alias"] = claimed_source_id
+                claimed_source_id = alias_entry["source_id"]
+                state["resolved_case_source_id"] = claimed_source_id
+                state["source_id_status"] = "declared_alias_resolved_to_case_hash"
+            else:
+                report.error(
+                    "invalid_evidence_source_id",
+                    "Evidence source_id must identify canonical file bytes or be a case-declared scenario/contract alias with a resolvable in-scope case JSON Pointer.",
+                    child_pointer(evidence_pointer, "source_id"), source_id=claimed_source_id,
+                )
+                state["source_id_status"] = "invalid"
+                claimed_source_id = None
     path_entry = registry.resolve_path(raw_path, child_pointer(evidence_pointer, path_key)) if path_key else None
     if path_key:
         state["path"] = raw_path
         state["path_status"] = "registered" if path_entry is not None else "unresolved"
-    id_entry = registry.entry_for_source_id(claimed_source_id, child_pointer(evidence_pointer, "source_id")) if claimed_source_id else None
+    id_entry = None
+    if claimed_source_id:
+        source_id_pointer = child_pointer(evidence_pointer, "source_id")
+        registered_paths = registry.by_id.get(claimed_source_id, {})
+        if path_entry is not None:
+            if not registered_paths:
+                registry.entry_for_source_id(claimed_source_id, source_id_pointer)
+            elif path_entry["path"] in registered_paths:
+                id_entry = path_entry
+        else:
+            id_entry = registry.entry_for_source_id(claimed_source_id, source_id_pointer)
     if id_entry is not None:
         state["source_id_status"] = "registered"
     elif claimed_source_id is not None and state["source_id_status"] == "present":
@@ -1406,7 +1784,7 @@ def validate_evidence_item(item, evidence_pointer, case, case_path, registry, re
         if text is not None:
             texts.append(("registered input text", text, False))
     if is_pdf:
-        texts.extend((label, text, True) for label, text, in provided_pdf_text(item, evidence_pointer, registry, report))
+        texts.extend((label, text, True) for label, text, in provided_pdf_text(item, evidence_pointer, registry, report, entry))
     if not texts:
         report.warning(
             "short_quote_text_unavailable",
@@ -1417,26 +1795,50 @@ def validate_evidence_item(item, evidence_pointer, case, case_path, registry, re
         return state
     normalized_quote = normalize_whitespace(quote)
     matched = [label for label, text, _ in texts if normalized_quote in normalize_whitespace(text)]
+    typesetting_only = False
+    if not matched:
+        quote_candidates = typesetting_candidates(quote)
+        matched = [
+            label for label, text, _ in texts
+            if any(candidate in variant for candidate in quote_candidates for variant in typesetting_candidates(text))
+        ]
+        typesetting_only = bool(matched)
     if not matched:
         report.error(
             "short_quote_mismatch",
-            "Whitespace-normalized short quote is not a substring of any available declared source text.",
+            "Short quote is not a continuous substring under direct whitespace comparison or the limited typesetting-only comparison.",
             child_pointer(evidence_pointer, quote_key), available_texts=[label for label, _, _ in texts],
             normalized_quote=normalized_quote,
+            tooltip=(
+                "Use an actual continuous substring and a real locator. Citation markers, numbers, words, "
+                "quotation marks, units, signs and Greek letters are never removed to force a match."
+            ),
         )
         state["quote_status"] = "mismatch"
         return state
     direct_matches = [label for label, text, derived in texts if not derived and label in matched]
-    if direct_matches:
+    if typesetting_only:
+        report.warning(
+            "quote_matched_typesetting_normalized",
+            "Quote matched only comparison-only typesetting candidates (Unicode NFKC, U+00AD removal, and letter-hyphen-newline keep/drop-dash variants). This is not a verbatim raw-content or full-page PDF assertion; no citation marker, word, number, unit, or sign is deleted to force a match.",
+            child_pointer(evidence_pointer, quote_key), matched_texts=matched,
+        )
+        state["quote_status"] = "matched_typesetting_normalized"
+        state["quote_matched_texts"] = matched
+        state["comparison_only"] = True
+    elif direct_matches:
         state["quote_status"] = "matched_whitespace_normalized"
         state["quote_matched_texts"] = direct_matches
     else:
+        state["quote_status"] = "matched_provided_extraction_unverified_against_pdf"
+    if not direct_matches:
         report.warning(
             "quote_matched_provided_extraction_only",
             "Quote matches supplied extraction text, not independently decoded PDF content; this is not raw-source quote verification.",
             child_pointer(evidence_pointer, quote_key), matched_texts=matched,
         )
-        state["quote_status"] = "matched_provided_extraction_unverified_against_pdf"
+        if not typesetting_only:
+            state["quote_status"] = "matched_provided_extraction_unverified_against_pdf"
     return state
 
 
@@ -1554,6 +1956,7 @@ def run(args, report):
     case_id_status, case_id = validate_case_id(case, result, report)
     validate_output_contract(case, result, report)
     validate_placeholders_and_ids(result, report)
+    semantic_scopes = scan_semantic_consistency(result, case, report)
     registry = SourceRegistry(inspection, args.case, report)
     if registry.available:
         scan_evidence(result, "result", case, args.case, registry, report)
@@ -1566,6 +1969,93 @@ def run(args, report):
             )
         else:
             report.checked["evidence_map"] = {"provided": True, "checked": False}
+        scan_semantic_consistency(
+            evidence_map, case, report, document_label="evidence_map",
+            result_scopes=semantic_scopes, result_document=result,
+        )
+
+
+def summary_counts(items, key):
+    counts = {}
+    for item in items:
+        value = item.get(key)
+        label = value if isinstance(value, str) else json_type(value)
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def summary_identity_value(value):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 160 else value[:157] + "..."
+    return {"json_type": json_type(value)}
+
+
+def make_summary_report(output):
+    checked = output["checked"]
+    warnings = output["warnings"]
+    warning_counts = {}
+    examples_by_code = {}
+    for warning in warnings:
+        code = warning.get("code", "uncoded_warning")
+        warning_counts[code] = warning_counts.get(code, 0) + 1
+        if code not in examples_by_code and len(examples_by_code) < 6:
+            example = {"code": code, "message": warning.get("message", "")}
+            if "pointer" in warning:
+                example["pointer"] = warning["pointer"]
+            examples_by_code[code] = example
+    case_state = checked.get("case_id", {})
+    case_identity = {
+        key: case_state[key] for key in ("checked", "status", "selection", "canonical_pointer")
+        if key in case_state
+    }
+    for key in ("expected", "actual"):
+        if key in case_state:
+            case_identity[key] = summary_identity_value(case_state[key])
+    contract_state = checked.get("output_contract", {})
+    contract_coverage = {
+        key: contract_state[key] for key in ("checked", "status", "selection", "kind", "canonical_pointer")
+        if key in contract_state
+    }
+    fingerprint_state = checked.get("inspection_case_fingerprint", {})
+    map_state = checked.get("evidence_map", {})
+    map_coverage = {
+        key: map_state[key] for key in (
+            "provided", "checked", "case_id_status", "result_pointers_checked", "result_pointer_occurrences"
+        ) if key in map_state
+    }
+    evidence = checked.get("evidence", [])
+    evidence_summary = {"count": len(evidence)}
+    for key in (
+        "source_id_status", "path_status", "hash_status", "json_pointer_status",
+        "quote_status", "locator_content_status",
+    ):
+        evidence_summary["by_" + key] = summary_counts(evidence, key)
+    return {
+        "valid": output["valid"],
+        "errors": output["errors"],
+        "warning_count": len(warnings),
+        "warnings_by_code": dict(sorted(warning_counts.items())),
+        "warning_examples": list(examples_by_code.values()),
+        "case_identity": case_identity,
+        "evidence": evidence_summary,
+        "checked": {
+            "strict_json": checked.get("strict_json", {}),
+            "output_contract": contract_coverage,
+            "inspection_case_fingerprint": {
+                key: fingerprint_state[key] for key in ("checked", "status") if key in fingerprint_state
+            },
+            "evidence_map": map_coverage,
+            "exact_placeholders": checked.get("exact_placeholders", {"checked": False}),
+            "duplicate_identifiers": checked.get("duplicate_identifiers", {"checked": False}),
+            "semantic_diagnostics": checked.get("semantic_diagnostics", {"checked": False}),
+        },
+        "scope": (
+            "Mechanical JSON/contract and registered-evidence checks only. Warnings remain part of the verdict. "
+            "No scientific approval, verbatim raw rendering, or full-page PDF verification is implied."
+        ),
+    }
 
 
 def build_parser():
@@ -1576,19 +2066,24 @@ def build_parser():
     parser.add_argument("--result", required=True, help="Result JSON to validate")
     parser.add_argument("--inspection", required=True, help="Inspection produced by inspect_case.py")
     parser.add_argument("--evidence", help="Optional evidence_map.json")
+    parser.add_argument("--summary", action="store_true", help="Emit compact machine diagnostics while retaining every error")
     return parser
 
 
 def main(argv=None):
     report = Report()
+    summary = False
     try:
         args = build_parser().parse_args(argv)
+        summary = args.summary
         run(args, report)
     except InputError as exc:
         report.error("input_error", str(exc))
     except OSError as exc:
         report.error("filesystem_error", str(exc))
     output = report.finish()
+    if summary:
+        output = make_summary_report(output)
     try:
         text = json.dumps(output, ensure_ascii=False, allow_nan=False, indent=2)
     except (TypeError, ValueError, RecursionError) as exc:

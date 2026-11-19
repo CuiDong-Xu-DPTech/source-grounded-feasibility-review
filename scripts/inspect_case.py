@@ -264,6 +264,23 @@ def normalized_key(key):
     return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
 
 
+FILE_REFERENCE_KEYS = {
+    "path", "file", "filename", "filepath", "file_path", "original_path",
+    "input_path", "output_path", "source_path", "material_path",
+    "document_path", "artifact_path", "resource_path", "pdf_path",
+}
+KNOWN_FILE_EXTENSIONS = {
+    ".pdf", ".txt", ".text", ".md", ".rst", ".json", ".jsonl", ".yaml",
+    ".yml", ".toml", ".ini", ".cfg", ".csv", ".tsv", ".xml", ".html",
+    ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".tex",
+    ".png", ".jpg", ".jpeg", ".svg", ".tif", ".tiff", ".bmp", ".gif",
+    ".log", ".out", ".err", ".py", ".r", ".rmd", ".ipynb", ".m", ".sh",
+    ".fasta", ".fastq", ".fa", ".fq", ".fna", ".sam", ".bam", ".vcf",
+    ".bed", ".gtf", ".gff", ".npy", ".npz", ".zip", ".gz", ".tar",
+    ".tgz", ".bz2", ".xz", ".rds", ".h5", ".hdf5", ".parquet", ".dat",
+}
+
+
 def is_reference_key(key):
     normalized = normalized_key(key)
     if not normalized:
@@ -272,22 +289,52 @@ def is_reference_key(key):
     return any(term in tokens or normalized.endswith("_" + term) for term in PATH_KEY_TERMS)
 
 
+def is_file_reference_key(key):
+    normalized = normalized_key(key)
+    return normalized in FILE_REFERENCE_KEYS or normalized.endswith(("_path", "_file", "_filename"))
+
+
+def has_known_file_extension(value):
+    base = value.split("#", 1)[0].rstrip()
+    dot = base.rfind(".")
+    slash = max(base.rfind("/"), base.rfind("\\"))
+    return dot > slash and base[dot:].lower() in KNOWN_FILE_EXTENSIONS
+
+
 def path_shaped(value):
-    suffix = PATH_SUFFIX_RE.search(value)
-    meaningful_extension = (
-        suffix is not None and suffix.start() > 0
-        and suffix.group()[1:2].isalpha() and not re.search(r"\s", value)
-    )
-    return "/" in value or "\\" in value or meaningful_extension
+    if has_known_file_extension(value):
+        return True
+    if re.search(r"\s", value):
+        return False
+    return "/" in value or "\\" in value
+
+
+def resolves_json_pointer(case, value):
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    current = case
+    try:
+        for raw_token in value[1:].split("/"):
+            if re.search(r"~(?![01])", raw_token):
+                return False
+            token = raw_token.replace("~1", "/").replace("~0", "~")
+            if isinstance(current, dict) and token in current:
+                current = current[token]
+            elif isinstance(current, list) and re.fullmatch(r"(?:0|[1-9][0-9]*)", token):
+                current = current[int(token)]
+            else:
+                return False
+        return True
+    except (IndexError, KeyError, TypeError):
+        return False
 
 
 def reference_candidate(value, key_context):
     if not isinstance(value, str):
         return False
     stripped = value.strip()
-    normalized_key_name = normalized_key(key_context)
     if not stripped:
-        return normalized_key_name == "path" or normalized_key_name.endswith("_path")
+        return is_file_reference_key(key_context) or is_reference_key(key_context)
     if len(value) > PATH_STRING_LIMIT or "\x00" in value or "\n" in value or "\r" in value:
         return False
     if SKIPPED_URI_RE.match(stripped) or stripped.startswith("#"):
@@ -301,10 +348,11 @@ def candidate_files(raw_path, resource_root, case_directory):
     stripped = raw_path.strip()
     if not stripped:
         return []
-    if os.path.isabs(stripped):
-        candidates = [stripped]
+    file_part = stripped.split("#", 1)[0] if has_known_file_extension(stripped) else stripped
+    if os.path.isabs(file_part):
+        candidates = [file_part]
     else:
-        candidates = [os.path.join(resource_root, stripped), os.path.join(case_directory, stripped)]
+        candidates = [os.path.join(resource_root, file_part), os.path.join(case_directory, file_part)]
     result = []
     seen = set()
     for candidate in candidates:
@@ -410,7 +458,8 @@ def collect_case_review(case):
                     )
                 else:
                     resource_lists_truncated = True
-        elif isinstance(value, str) and reference_candidate(value, key_context):
+        elif (isinstance(value, str) and reference_candidate(value, key_context)
+              and not resolves_json_pointer(case, value.strip())):
             references.append({"pointer": pointer, "value": value, "key_context": key_context})
     case_ids.sort(key=lambda item: item["pointer"])
     contracts.sort(key=lambda item: item["pointer"])
@@ -482,9 +531,21 @@ def inspect(args):
     skipped_symlinks = []
     symlink_count = 0
 
-    def add_source(path, role, case_pointers=None, known_bytes=None):
+    additional_roots = list(dict.fromkeys(
+        os.path.abspath(path) for path in args.additional_resource_root
+    ))
+    root_specs = [(resource_root, False)]
+    seen_roots = {resource_root}
+    for root in additional_roots:
+        if root not in seen_roots:
+            root_specs.append((root, True))
+            seen_roots.add(root)
+
+    def add_source(path, role, case_pointers=None, known_bytes=None, inventory_root=None):
         absolute = os.path.abspath(path)
         case_pointers = case_pointers or []
+        if inventory_root is not None and descendant_has_symlink(inventory_root, absolute):
+            raise OSError("a path component below the inventory root is a symlink")
         if absolute in by_path:
             entry = sources[by_path[absolute]]
             if role not in entry["roles"]:
@@ -492,6 +553,8 @@ def inspect(args):
             for pointer in case_pointers:
                 if pointer not in entry["case_json_pointers"]:
                     entry["case_json_pointers"].append(pointer)
+            if inventory_root is not None and inventory_root not in entry["inventory_roots"]:
+                entry["inventory_roots"].append(inventory_root)
             return entry
         if not regular_file_without_final_symlink(absolute):
             raise OSError("not a regular non-symlink file")
@@ -510,6 +573,7 @@ def inspect(args):
             "extension": extension,
             "case_json_pointers": sorted(set(case_pointers)),
             "roles": [role],
+            "inventory_roots": [inventory_root] if inventory_root is not None else [],
         }
         if extension == ".pdf":
             entry["content_extraction"] = {
@@ -530,18 +594,27 @@ def inspect(args):
 
     inventory_truncated = False
     inventory_files_seen = 0
-    if os.path.islink(resource_root):
-        diagnostics.append(
-            {"severity": "warning", "code": "resource_root_symlink", "path": resource_root,
-             "message": "Resource root is a symlink and was not traversed."}
-        )
-    elif not os.path.isdir(resource_root):
-        diagnostics.append(
-            {"severity": "warning", "code": "resource_root_unavailable", "path": resource_root,
-             "message": "Resource root is not an available directory; this is not proof that references do not exist."}
-        )
-    else:
-        directories = [resource_root]
+    inventoried_paths = set()
+    scanned_inventory_roots = []
+
+    def scan_inventory_root(root, additional):
+        nonlocal inventory_truncated, inventory_files_seen, symlink_count
+        prefix = "additional_resource_root" if additional else "resource_root"
+        if os.path.islink(root):
+            diagnostics.append(
+                {"severity": "warning", "code": prefix + "_symlink", "path": root,
+                 "message": "Inventory root is a symlink and was not traversed."}
+            )
+            return
+        if not os.path.isdir(root):
+            diagnostics.append(
+                {"severity": "warning", "code": prefix + "_unavailable", "path": root,
+                 "message": "Inventory root is not an available directory; this is not proof that references do not exist."}
+            )
+            return
+        scanned_inventory_roots.append(root)
+        role = "additional_resource_root_inventory" if additional else "resource_root_inventory"
+        directories = [root]
         while directories and not inventory_truncated:
             directory = directories.pop(0)
             try:
@@ -549,7 +622,7 @@ def inspect(args):
             except OSError as exc:
                 diagnostics.append(
                     {"severity": "warning", "code": "directory_read_failed", "path": directory,
-                     "message": str(exc)}
+                     "inventory_root": root, "message": str(exc)}
                 )
                 continue
             for entry in entries:
@@ -565,22 +638,30 @@ def inspect(args):
                         continue
                     if not entry.is_file(follow_symlinks=False):
                         continue
+                    if path in inventoried_paths:
+                        continue
+                    inventoried_paths.add(path)
                     inventory_files_seen += 1
                     if inventory_files_seen > args.max_files:
                         inventory_truncated = True
                         break
                     try:
-                        add_source(path, "resource_root_inventory")
+                        add_source(path, role, inventory_root=root)
                     except OSError as exc:
                         diagnostics.append(
                             {"severity": "warning", "code": "inventory_hash_failed", "path": path,
-                             "message": str(exc)}
+                             "inventory_root": root, "message": str(exc)}
                         )
                 except OSError as exc:
                     diagnostics.append(
                         {"severity": "warning", "code": "inventory_entry_failed", "path": path,
-                         "message": str(exc)}
+                         "inventory_root": root, "message": str(exc)}
                     )
+
+    for inventory_root, additional in root_specs:
+        if inventory_truncated:
+            break
+        scan_inventory_root(inventory_root, additional)
 
     task_registration = {"path": task_path, "registered": False}
     if regular_file_without_final_symlink(task_path) and not descendant_has_symlink(resource_root, task_path):
@@ -605,6 +686,9 @@ def inspect(args):
         for path in attempted:
             if regular_file_without_final_symlink(path) and not descendant_has_symlink(resource_root, path):
                 existing.append(path)
+        if (not existing and not is_file_reference_key(reference["key_context"])
+                and not has_known_file_extension(raw_path)):
+            continue
         if not existing:
             missing_references.append(
                 {
@@ -642,11 +726,16 @@ def inspect(args):
     for entry in sources:
         entry["case_json_pointers"].sort()
         entry["roles"].sort()
+        entry["inventory_roots"].sort()
     rubric_16 = [item["pointer"] for item in review["rubric_occurrences"] if item["has_16_items"]]
     report = {
         "inspection_version": "1.0",
         "case_file": case_file,
         "resource_root": resource_root,
+        "metadata": {
+            "additional_resource_roots": additional_roots,
+            "scanned_inventory_roots": scanned_inventory_roots,
+        },
         "task_file": task_registration,
         "case_id": case_id,
         "case_id_status": case_id_status,
@@ -675,6 +764,8 @@ def inspect(args):
         "source_registry": {
             "source_id_format": "sha256:<64 lowercase hex digits>",
             "hash_input": "raw file bytes",
+            "additional_resource_roots": additional_roots,
+            "scanned_inventory_roots": scanned_inventory_roots,
             "sources": sources,
             "file_count_limit": args.max_files,
             "inventory_files_seen": inventory_files_seen,
@@ -705,6 +796,10 @@ def build_parser():
     parser.add_argument("--task", required=True, help="Path to task.md; registered only when it exists")
     parser.add_argument("--output", required=True, help="Atomic UTF-8 inspection JSON destination")
     parser.add_argument("--resource-root", default="/input", help="Inventory root (default: /input)")
+    parser.add_argument(
+        "--additional-resource-root", action="append", default=[], metavar="PATH",
+        help="Additional derived-file inventory root; may repeat. Original case path resolution is unchanged.",
+    )
     parser.add_argument(
         "--max-files", type=int, default=2000,
         help="Maximum regular files inventoried and hashed (default: 2000; references may add more)",
